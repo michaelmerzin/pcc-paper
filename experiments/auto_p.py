@@ -1,126 +1,195 @@
-"""No-sweep auto-sparsity: pick p* from cross-fit R^2 instead of evaluating
-the whole sweep on a held-out set.
+"""Cross-fit auto-sparsity selector (X-Delta-CAP).
+
+For each o_proj row, fit the ridge on one fold of the calibration pool
+and measure held-out R^2 on the other. Score each row by
+max(0, R^2) * Var(delta) and keep the shortest prefix covering
+`cumulative_target` of the total score, subject to:
+  - late-layer restriction (l >= L // 2)
+  - sparsity clamp p in [P_MIN, P_MAX]
+  - per-layer cap LAYER_CAP_FRAC * d rows
+
+Matches Section 3.3 of the paper.
 """
-import argparse
-import json
-import os
-import sys
+import random
+from typing import Dict, List, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from pcc.config import ExperimentConfig, MODELS
-from pcc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj, get_layers
-from pcc.tasks import get_task, effective_k_shots
-from pcc.eval_engine import evaluate, build_shots_per_example, build_correction_set
-from pcc.sensitivity import compute_sensitivity, collect_calibration_tensors
-from pcc.edit import apply_edit
-from pcc.auto_sparsity import auto_select_rows_xdelta
+import torch
 
 
-def run_auto_p(model, tok, cfg, ORIG, verbose=True):
-    task = get_task(cfg.task_key)
-    k = effective_k_shots(cfg, task)
-    cfg.max_seq_len = cfg.max_seq_len or task.recommended_max_seq_len
-    use_canon = (task.canonical_demos is not None
-                 and k == len(task.canonical_demos)
-                 and cfg.use_canonical_demos)
-
-    demo_pool, calib_pool, eval_set = task.load_data(cfg)
-    calib_shots = build_shots_per_example(task, demo_pool, calib_pool, k, 0, use_canon)
-    eval_shots = build_shots_per_example(task, demo_pool, eval_set, k, 0, use_canon)
-
-    ns_acc, _, _ = evaluate(model, tok, task, eval_set,
-                            [[] for _ in eval_set], cfg.max_seq_len)
-    fs_acc, _, _ = evaluate(model, tok, task, eval_set, eval_shots, cfg.max_seq_len)
-
-    _, cp_ns, _ = evaluate(model, tok, task, calib_pool,
-                           [[] for _ in calib_pool], cfg.max_seq_len)
-    _, cp_fs, _ = evaluate(model, tok, task, calib_pool, calib_shots, cfg.max_seq_len)
-    g_idx = build_correction_set(calib_pool, cp_ns, cp_fs, task)
-    G = [calib_pool[i] for i in g_idx]
-    G_demos = [calib_shots[i] for i in g_idx]
-    if len(G) < 8:
-        raise RuntimeError(f"G too small ({len(G)}) for cross-fit")
-
-    print(f"  NS={ns_acc*100:.2f}  FS={fs_acc*100:.2f}  |G|={len(G)}")
-
-    SCORES = compute_sensitivity(model, tok, task, G, G_demos,
-                                 cfg.num_layers, cfg.hidden_size, cfg.max_seq_len,
-                                 verbose=False)
-    H_NS, Z_FS = collect_calibration_tensors(model, tok, task, G, G_demos,
-                                             cfg.num_layers, cfg.hidden_size,
-                                             cfg.max_seq_len, verbose=False)
-    W0 = {l: get_layers(model)[l].self_attn.o_proj.weight.detach().cpu().float()
-          for l in range(cfg.num_layers)}
-
-    selected, p_star, R2 = auto_select_rows_xdelta(
-        H_NS, Z_FS, W0, cfg.num_layers, cfg.hidden_size, cfg.mu,
-        cumulative_target=0.90)
-    print(f"  auto p* = {p_star:.4f}  ({len(selected)} rows)")
-
-    n_edit, _ = apply_edit(model, selected, H_NS, Z_FS, cfg.mu, cfg.alpha)
-    auto_acc, _, _ = evaluate(model, tok, task, eval_set,
-                              [[] for _ in eval_set], cfg.max_seq_len)
-    restore_o_proj(model, ORIG)
-
-    recovery = (auto_acc - ns_acc) / max(1e-8, fs_acc - ns_acc)
-    print(f"  auto-edit = {auto_acc*100:.2f}  recovery = {recovery*100:.1f}%")
-
-    return {
-        "model": cfg.model_key, "task": cfg.task_key,
-        "ns_acc": ns_acc, "fs_acc": fs_acc,
-        "auto_edit_acc": auto_acc, "p_star": p_star,
-        "n_edited": n_edit, "g_full_size": len(G),
-        "recovery_pct": recovery * 100,
-    }
+# Hyperparameters from the paper.
+P_MIN = 0.05
+P_MAX = 0.3
+LAYER_CAP_FRAC = 0.65
+CUMULATIVE_TARGET = 0.90
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, choices=list(MODELS))
-    ap.add_argument("--tasks", nargs="+", required=True)
-    ap.add_argument("--out-dir", default="runs/auto_p")
-    ap.add_argument("--n-eval", type=int, default=150)
-    ap.add_argument("--n-calib-pool", type=int, default=500)
-    args = ap.parse_args()
+def _ridge_solve_chunk(H_fit: torch.Tensor, Y_fit_chunk: torch.Tensor,
+                       mu: float) -> torch.Tensor:
+    """Solve (H^T H + mu I) X = H^T Y for a chunk of output columns."""
+    A = H_fit.T @ H_fit
+    A.diagonal().add_(float(mu))
+    B = H_fit.T @ Y_fit_chunk
 
-    cfg0 = ExperimentConfig(model_key=args.model, task_key=args.tasks[0],
-                            n_eval=args.n_eval, n_calib_pool=args.n_calib_pool,
-                            out_dir=args.out_dir)
-    cfg0.finalize()
-    model, tok = load_model_and_tokenizer(cfg0)
-    ORIG = snapshot_o_proj(model)
+    try:
+        chol = torch.linalg.cholesky(A)
+    except Exception:
+        A.diagonal().add_(1e-3)
+        chol = torch.linalg.cholesky(A)
 
-    results = []
-    for tk in args.tasks:
-        print(f"\n{'='*70}\n  auto-p :: {args.model} x {tk}\n{'='*70}")
-        cfg = ExperimentConfig(model_key=args.model, task_key=tk,
-                               n_eval=args.n_eval, n_calib_pool=args.n_calib_pool,
-                               num_layers=cfg0.num_layers, hidden_size=cfg0.hidden_size,
-                               out_dir=args.out_dir)
-        cfg.finalize()
-        try:
-            r = run_auto_p(model, tok, cfg, ORIG)
-            results.append(r)
-        except Exception as e:
-            print(f"  [ERROR] {tk}: {e}")
-            import traceback; traceback.print_exc()
-        finally:
-            restore_o_proj(model, ORIG)
-
-    with open(os.path.join(args.out_dir, f"{args.model}_auto_p.json"), "w") as f:
-        json.dump(results, f, indent=2)
-
-    print()
-    print("=" * 70)
-    print(f"  auto-p :: {args.model.upper()}")
-    print("=" * 70)
-    print(f"{'Task':<16} {'NS':>8} {'FS':>8} {'Auto':>10} {'p*':>8} {'Rec':>10}")
-    print("-" * 70)
-    for r in results:
-        print(f"{r['task']:<16} {r['ns_acc']*100:>7.2f} {r['fs_acc']*100:>7.2f} "
-              f"{r['auto_edit_acc']*100:>9.2f} {r['p_star']:>8.4f} {r['recovery_pct']:>9.1f}%")
+    X = torch.cholesky_solve(B, chol)
+    return X.T  # shape: (chunk, d)
 
 
-if __name__ == "__main__":
-    main()
+def auto_select_rows_xdelta(
+    H_NS: Dict[int, torch.Tensor],
+    Z_FS: Dict[int, torch.Tensor],
+    W0: Dict[int, torch.Tensor],
+    num_layers: int,
+    hidden_size: int,
+    mu: float,
+    cumulative_target: float = CUMULATIVE_TARGET,
+    chunk_rows: int = 512,
+    seed: int = 0,
+    device: str = "cuda",
+    verbose: bool = False,
+) -> Tuple[List[Tuple[int, int]], float, Dict[Tuple[int, int], float]]:
+    """Cross-fit selector matching the paper.
+
+    Returns:
+        selected: list of (layer, row) pairs
+        p_star:   selected_count / (L * d)
+        R2_map:   {(layer, row): score} for diagnostics
+    """
+    L = int(num_layers)
+    d = int(hidden_size)
+
+    # ----- 1. derive observed deltas -----
+    # Z_FS is the with-context o_proj output; H_NS @ W0^T is the no-context
+    # output, so delta = Z_FS - (H_NS @ W0^T).
+    Z_NS = {}
+    for l in range(L):
+        if l in H_NS and l in W0:
+            Z_NS[l] = (H_NS[l].float() @ W0[l].float().T).cpu()
+
+    # ----- 2. score rows on late layers only -----
+    layers_to_use = list(range(L // 2, L))
+
+    all_rows: List[Tuple[float, int, int]] = []
+    per_layer_total_score: Dict[int, float] = {}
+
+    for l in layers_to_use:
+        if l not in H_NS or l not in Z_FS or l not in Z_NS:
+            continue
+
+        H = H_NS[l].float()
+        Y = (Z_FS[l].float() - Z_NS[l].float())  # observed delta, shape (m, d)
+        m, d_check = H.shape
+        assert d_check == d, (d_check, d)
+
+        # Split calibration examples into two folds.
+        rng = random.Random(seed + 1009 * l)
+        idx = list(range(m))
+        rng.shuffle(idx)
+        half = m // 2
+        idx_a = torch.tensor(idx[:half], dtype=torch.long)
+        idx_b = torch.tensor(idx[half:], dtype=torch.long)
+
+        if len(idx_a) < 2 or len(idx_b) < 2:
+            continue
+
+        layer_score = torch.zeros(d, dtype=torch.float32)
+        folds = [(idx_a, idx_b), (idx_b, idx_a)]
+
+        for fit_idx, val_idx in folds:
+            H_fit = H[fit_idx].to(device)
+            Y_fit = Y[fit_idx].to(device)
+            H_val = H[val_idx].to(device)
+            Y_val = Y[val_idx].to(device)
+
+            # SS_tot per column = |B| * Var(delta) (up to the 1/|B| factor;
+            # we keep it in this form so score = max(0,R2) * Var(delta) drops
+            # straight out of max(0, SS_tot - SS_res) / |B|).
+            y_mean = Y_val.mean(dim=0, keepdim=True)
+            sst = ((Y_val - y_mean) ** 2).sum(dim=0) + 1e-8
+
+            fold_score = torch.zeros(d, dtype=torch.float32, device="cpu")
+
+            for start in range(0, d, chunk_rows):
+                end = min(start + chunk_rows, d)
+
+                DeltaW_chunk = _ridge_solve_chunk(
+                    H_fit=H_fit, Y_fit_chunk=Y_fit[:, start:end], mu=mu,
+                )
+                pred = H_val @ DeltaW_chunk.T
+
+                residual = Y_val[:, start:end] - pred
+                sse = (residual ** 2).sum(dim=0)
+                sst_chunk = sst[start:end]
+
+                r2 = 1.0 - sse / sst_chunk
+                r2_pos = torch.clamp(r2, min=0.0)
+
+                # max(0, R2) * Var(delta), modulo the 1/|B| factor on Var.
+                # Constant factor doesn't affect ranking, but keep it
+                # equivalent for transparency.
+                var_delta = sst_chunk / max(1, len(val_idx))
+                score = r2_pos * var_delta
+
+                fold_score[start:end] = score.detach().float().cpu()
+
+            layer_score += fold_score / len(folds)
+
+        total_score = float(layer_score.sum().item())
+        per_layer_total_score[l] = total_score
+
+        for j in range(d):
+            s = float(layer_score[j].item())
+            if s > 0:
+                all_rows.append((s, l, j))
+
+        if verbose:
+            print(f"[auto-p] layer={l:02d} "
+                  f"total_score={total_score:.4e} "
+                  f"max_row={float(layer_score.max().item()):.4e}")
+
+    if not all_rows:
+        raise RuntimeError("auto-p: no positive-scoring rows found")
+
+    # ----- 3. shortest 90% prefix -----
+    all_rows.sort(reverse=True, key=lambda x: x[0])
+
+    scores = torch.tensor([x[0] for x in all_rows], dtype=torch.float32)
+    cum = torch.cumsum(scores, dim=0) / (scores.sum() + 1e-12)
+    k_energy = int(torch.searchsorted(cum, torch.tensor(cumulative_target)).item()) + 1
+
+    # ----- 4. sparsity clamp -----
+    total_rows = L * d
+    min_k = int(round(P_MIN * total_rows))
+    max_k = int(round(P_MAX * total_rows))
+    k = max(k_energy, min_k)
+    k = min(k, max_k, len(all_rows))
+
+    # ----- 5. per-layer cap -----
+    layer_cap = int(round(LAYER_CAP_FRAC * d))
+    selected: List[Tuple[int, int]] = []
+    layer_counts: Dict[int, int] = {}
+    R2_map: Dict[Tuple[int, int], float] = {}
+
+    for score, l, j in all_rows:
+        if len(selected) >= k:
+            break
+        if layer_counts.get(l, 0) >= layer_cap:
+            continue
+        selected.append((l, j))
+        layer_counts[l] = layer_counts.get(l, 0) + 1
+        R2_map[(l, j)] = score
+
+    p_star = len(selected) / float(total_rows)
+
+    if verbose:
+        print(f"[auto-p] k_energy={k_energy}  k_after_clamp={k}  "
+              f"layer_cap={layer_cap}  p*={p_star:.4f}")
+        print(f"[auto-p] selected per-layer: "
+              f"{sorted(layer_counts.items(), key=lambda x: x[1], reverse=True)}")
+
+    return selected, p_star, R2_map
