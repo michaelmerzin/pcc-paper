@@ -10,12 +10,12 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pcc.config import ExperimentConfig, MODELS
-from pcc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj, get_layers
-from pcc.tasks import get_task, effective_k_shots
-from pcc.eval_engine import evaluate, build_shots_per_example, build_correction_set
-from pcc.sensitivity import compute_sensitivity, collect_calibration_tensors
-from pcc.auto_sparsity import auto_select_rows_xdelta
+from icc.config import ExperimentConfig, MODELS
+from icc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj, get_layers
+from icc.tasks import get_task, effective_k_shots
+from icc.eval_engine import evaluate, build_shots_per_example, build_correction_set
+from icc.sensitivity import compute_sensitivity, collect_calibration_tensors
+from icc.auto_sparsity import auto_select_rows_xdelta
 
 
 def analyze_one(model, tok, cfg, ORIG, top_k=10):

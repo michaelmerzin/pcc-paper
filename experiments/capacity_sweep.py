@@ -10,10 +10,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 
-from pcc.config import ExperimentConfig, MODELS
-from pcc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
-from pcc.pipeline import run_pcc_multi_seed
-from pcc.tasks import TASKS
+from icc.config import ExperimentConfig, MODELS
+from icc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
+from icc.pipeline import run_pcc_multi_seed
+from icc.tasks import TASKS
 
 
 SPARSITY_GRIDS = {

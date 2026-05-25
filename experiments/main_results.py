@@ -10,10 +10,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-from pcc.config import ExperimentConfig, MODELS
-from pcc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
-from pcc.pipeline import run_pcc_multi_seed
-from pcc.tasks import TASKS
+from icc.config import ExperimentConfig, MODELS
+from icc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
+from icc.pipeline import run_pcc_multi_seed
+from icc.tasks import TASKS
 
 
 # Per-task settings used in the runs. n_calib is *small* for SST-2/MRPC on

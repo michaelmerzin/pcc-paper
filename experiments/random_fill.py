@@ -8,13 +8,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 
-from pcc.config import ExperimentConfig
-from pcc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
-from pcc.tasks import get_task, effective_k_shots
-from pcc.eval_engine import evaluate, build_shots_per_example, build_correction_set
-from pcc.sensitivity import compute_sensitivity, collect_calibration_tensors
-from pcc.edit import select_rows, apply_edit
-from pcc.baselines.random_fill import apply_random_fill
+from icc.config import ExperimentConfig
+from icc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
+from icc.tasks import get_task, effective_k_shots
+from icc.eval_engine import evaluate, build_shots_per_example, build_correction_set
+from icc.sensitivity import compute_sensitivity, collect_calibration_tensors
+from icc.edit import select_rows, apply_edit
+from icc.baselines.random_fill import apply_random_fill
 
 
 def main():

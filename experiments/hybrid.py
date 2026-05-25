@@ -11,13 +11,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pcc.config import ExperimentConfig
-from pcc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
-from pcc.tasks import get_task, effective_k_shots
-from pcc.eval_engine import evaluate, build_shots_per_example, build_correction_set
-from pcc.sensitivity import compute_sensitivity, collect_calibration_tensors
-from pcc.edit import select_rows, apply_edit
-from pcc.unsupervised import rank_by_kl, select_top_kl_balanced, estimate_unsupervised_precision
+from icc.config import ExperimentConfig
+from icc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
+from icc.tasks import get_task, effective_k_shots
+from icc.eval_engine import evaluate, build_shots_per_example, build_correction_set
+from icc.sensitivity import compute_sensitivity, collect_calibration_tensors
+from icc.edit import select_rows, apply_edit
+from icc.unsupervised import rank_by_kl, select_top_kl_balanced, estimate_unsupervised_precision
 
 
 def fit_and_eval(model, tok, cfg, ORIG, examples, demos, eval_set, p_grid, tag):

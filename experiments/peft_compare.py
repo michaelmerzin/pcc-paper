@@ -11,19 +11,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 import torch
 
-from pcc.config import ExperimentConfig
-from pcc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
-from pcc.tasks import get_task, effective_k_shots
-from pcc.eval_engine import evaluate, build_shots_per_example, build_correction_set
-from pcc.sensitivity import compute_sensitivity, collect_calibration_tensors
-from pcc.edit import select_rows, apply_edit
-from pcc.baselines.function_vector import (
+from icc.config import ExperimentConfig
+from icc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
+from icc.tasks import get_task, effective_k_shots
+from icc.eval_engine import evaluate, build_shots_per_example, build_correction_set
+from icc.sensitivity import compute_sensitivity, collect_calibration_tensors
+from icc.edit import select_rows, apply_edit
+from icc.baselines.function_vector import (
     collect_full_outputs, compute_function_vector_delta, FunctionVectorInjector,
 )
-from pcc.baselines import peft as peft_lib
-from pcc.baselines.dora import train_dora
-from pcc.baselines.loreft import train_loreft, unload_loreft
-from pcc.baselines.icv import run_icv_sweep
+from icc.baselines import peft as peft_lib
+from icc.baselines.dora import train_dora
+from icc.baselines.loreft import train_loreft, unload_loreft
+from icc.baselines.icv import run_icv_sweep
 
 
 # Best-p found in the main sweep, used to skip the inner sweep when running peft compare.
