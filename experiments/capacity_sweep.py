@@ -1,7 +1,6 @@
 """Per-task capacity sweep: write the full p-sweep CSV instead of just the best.
 
 Same pipeline as main_results but with a different sparsity grid for Gemma
-(it likes p in {0.05, 0.075, 0.10, ...} — see SPARSITY_GRIDS).
 """
 import argparse
 import os
@@ -20,7 +19,7 @@ from pcc.tasks import TASKS
 SPARSITY_GRIDS = {
     "mistral7b": (0.05, 0.10, 0.15, 0.20, 0.25, 0.30),
     "phi3_mini": (0.05, 0.10, 0.15, 0.20, 0.25, 0.30),
-    "gemma2_2b": (0.050, 0.075, 0.100, 0.150, 0.200, 0.250, 0.300),
+    "gemma2_2b": (0.050, 0.075, 0.10, 0.15, 0.20, 0.25, 0.30),
 }
 
 
