@@ -25,9 +25,9 @@ TASK_DEFAULTS = {
     "sst2":          dict(n_eval=872, n_train_pool=100, n_calib_pool=500, n_calib=4,  bs_eval=4, max_seq_len=512,  rand_baseline_seeds=(42, 137, 271)),
     "mrpc":          dict(n_eval=408, n_train_pool=100, n_calib_pool=400, n_calib=4,  bs_eval=4, max_seq_len=512,  rand_baseline_seeds=(42, 137, 271)),
     "gsm8k":         dict(n_eval=150, n_train_pool=128, n_calib_pool=500, n_calib=8,  bs_eval=1, max_seq_len=1024, rand_baseline_seeds=(42, 137, 271)),
-    "boolq":         dict(n_eval=872, n_train_pool=100, n_calib_pool=400, n_calib=16, bs_eval=2, max_seq_len=1536, rand_baseline_seeds=(42, 137)),
-    "arc_challenge": dict(n_eval=500, n_train_pool=120, n_calib_pool=300, n_calib=16, bs_eval=2, max_seq_len=1024, rand_baseline_seeds=(42, 137)),
-    "mmlu":          dict(n_eval=500, n_train_pool=285, n_calib_pool=500, n_calib=32, bs_eval=1, max_seq_len=2048, rand_baseline_seeds=(42, 137)),
+    "boolq":         dict(n_eval=872, n_train_pool=100, n_calib_pool=400, n_calib=16, bs_eval=2, max_seq_len=1536, rand_baseline_seeds=(42, 137, 271)),
+    "arc_challenge": dict(n_eval=500, n_train_pool=120, n_calib_pool=300, n_calib=16, bs_eval=2, max_seq_len=1024, rand_baseline_seeds=(42, 137, 271)),
+    "mmlu":          dict(n_eval=500, n_train_pool=285, n_calib_pool=500, n_calib=32, bs_eval=1, max_seq_len=2048, rand_baseline_seeds=(42, 137, 271)),
 }
 
 FS_SEEDS = {
@@ -38,7 +38,7 @@ FS_SEEDS = {
     "gsm8k":         (1, 2),
     "boolq":         (1, 2),
     "arc_challenge": (1, 2),
-    "mmlu":          (0,),    # single seed for mmlu — expensive and stable enough
+    "mmlu":          (1, 2),    # single seed for mmlu — expensive and stable enough
 }
 
 
