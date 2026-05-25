@@ -1,6 +1,11 @@
-"""Label-free calibration: rank candidates by KL(p_ns || p_fs) over label tokens.
-Used when we don't have access to gold labels for filtering.
+"""Label-free calibration: rank candidates by KL(p_fs || p_ns) over label tokens.
 
+We use the reverse direction (p_fs as the reference) because it is mode-seeking
+on p_fs: it spikes when p_ns puts low probability where the few-shot prompt is
+confident — the unsupervised analogue of the supervised correction set G
+(examples where few-shot is right and no-shot is wrong).
+
+Used when we don't have access to gold labels for filtering.
 Hybrid (table 5): filter G_full by correctness first, THEN rank by KL.
 """
 import random
@@ -22,6 +27,7 @@ def _label_token_ids(tokenizer, labels, device):
 def rank_by_kl(model, tokenizer, task, calib_pool, demo_pool, k_shots, max_seq_len,
                seed=0, use_canonical=False, n_scan=200, verbose=True):
     """Returns sorted list of (index, kl, ns_pred, fs_pred), descending by KL.
+    KL is D_KL(p_fs || p_ns) over the label-token distribution.
     Only meaningful for classification."""
     if task.num_classes is None:
         raise ValueError(f"KL ranking needs a class vocab; {task.name} is generative.")
@@ -58,6 +64,8 @@ def rank_by_kl(model, tokenizer, task, calib_pool, demo_pool, k_shots, max_seq_l
         logits_fs = out_fs.logits[0, -1][label_ids].float()
         p_ns = F.softmax(logits_ns, dim=-1).clamp(min=1e-8)
         p_fs = F.softmax(logits_fs, dim=-1).clamp(min=1e-8)
+        # F.kl_div(input=log q, target=p) computes sum p * (log p - log q) = D_KL(p || q)
+        # so input=log(p_ns), target=p_fs  gives  D_KL(p_fs || p_ns)
         kl = F.kl_div(p_ns.log(), p_fs, reduction="sum").item()
 
         ns_pred = label_strings[logits_ns.argmax().item()]
