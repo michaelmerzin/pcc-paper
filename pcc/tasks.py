@@ -1,28 +1,11 @@
-"""Task registry for all 8 paper benchmarks.
+"""Task definitions: prompt builders, parsers, samplers, dataset loaders.
 
-Tasks (paper §4):
-    sst2          — binary sentiment (GLUE)
-    mrpc          — paraphrase (GLUE)
-    ag_news       — 4-class topic
-    dbpedia_14    — 14-class topic
-    boolq         — yes/no reading comprehension (SuperGLUE)
-    arc_challenge — multiple-choice science (4 choices)
-    gsm8k         — grade-school math word problems (canonical 8-shot CoT)
-    mmlu          — multitask language understanding (5-shot, n=500)
-
-Each task is a Task dataclass with:
-  - load_data(cfg)              → (demo_pool, calib_pool, eval_set)
-  - build_prompt(ex, shots, fs) → str
-  - parse_pred(text)            → parsed prediction (str/None)
-  - gold(ex)                    → reference answer string
-  - score(pred, ex)             → bool
-  - sample_demos(pool, k, rng)  → list of demos (balanced for classification)
+A task is a Task dataclass with eight fields; everything downstream is generic.
 """
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Callable, List, Dict, Optional, Any
 import random
 import re
+from dataclasses import dataclass
+from typing import Callable, List, Dict, Optional, Any
 
 
 @dataclass
@@ -38,24 +21,26 @@ class Task:
     canonical_demos: Optional[List[Dict[str, Any]]] = None
     max_new_tokens: int = 8
     recommended_max_seq_len: int = 1024
-    num_classes: Optional[int] = None      # None = generative
+    num_classes: Optional[int] = None
 
 
-# =========================================================================== #
-#   Generic class-balanced demo sampler                                       #
-# =========================================================================== #
-def make_balanced_sampler(label_key: str, num_classes: int):
-    """Pick k shots balanced across classes, rotating order by example label."""
+def effective_k_shots(cfg, task):
+    if getattr(cfg, "k_shots", None) is not None:
+        return cfg.k_shots
+    return task.default_k_shots
+
+
+# Class-balanced sampler. Rotates the label order based on the query example's
+# label to make the FS demos look "natural" (the query's label shows up first).
+def make_balanced_sampler(label_key, num_classes):
     def sampler(pool, k, rng, example=None):
-        by_label: Dict[int, List] = {}
+        by_label = {}
         for ex in pool:
             by_label.setdefault(int(ex[label_key]), []).append(ex)
-
         labels = list(range(num_classes))
         if example is not None and label_key in example:
             pos = int(example[label_key]) % num_classes
             labels = labels[pos:] + labels[:pos]
-
         base, rem = k // num_classes, k % num_classes
         shots = []
         for i, y in enumerate(labels):
@@ -76,51 +61,41 @@ def canonical_first_sampler(pool, k, rng, example=None):
     return list(pool[:k])
 
 
-# =========================================================================== #
-#   SST-2 — binary sentiment (GLUE)                                           #
-# =========================================================================== #
-SST2_VERBALIZER = {0: "Negative", 1: "Positive"}
+# --- SST-2 -------------------------------------------------------------------
+
+SST2_V = {0: "Negative", 1: "Positive"}
 
 
 def _sst2_load(cfg):
     from datasets import load_dataset
     ds = load_dataset("glue", "sst2")
-    full = [{"text": ex["sentence"].strip(), "label": int(ex["label"])} for ex in ds["train"]]
+    full = [{"text": ex["sentence"].strip(), "label": int(ex["label"])}
+            for ex in ds["train"]]
     by_c = {0: [], 1: []}
     for ex in full:
         by_c[ex["label"]].append(ex)
-
     per_class = max(1, cfg.n_train_pool // 2)
     demo_pool = by_c[0][:per_class] + by_c[1][:per_class]
-
-    n_calib_per_class = max(10, cfg.n_calib_pool // 2)
-    calib_pool = (by_c[0][per_class:per_class + n_calib_per_class]
-                  + by_c[1][per_class:per_class + n_calib_per_class])
-    rng = random.Random(42); rng.shuffle(calib_pool)
-
+    n_cal_pc = max(10, cfg.n_calib_pool // 2)
+    calib_pool = by_c[0][per_class:per_class + n_cal_pc] + by_c[1][per_class:per_class + n_cal_pc]
+    random.Random(42).shuffle(calib_pool)
     eval_set = [{"text": ex["sentence"].strip(), "label": int(ex["label"])}
                 for ex in ds["validation"] if ex["label"] != -1]
-    eval_set = eval_set[:min(cfg.n_eval, len(eval_set))]
-    return demo_pool, calib_pool, eval_set
+    return demo_pool, calib_pool, eval_set[:cfg.n_eval]
 
 
-_SST2_INSTRUCTION = (
-    "Classify the sentiment of the following sentence as Positive or Negative.\n"
-    "Answer with only the sentiment label.\n\n"
-)
+_SST2_INSTR = ("Classify the sentiment of the following sentence as Positive or Negative.\n"
+               "Answer with only the sentiment label.\n\n")
 
 
 def _sst2_prompt(ex, shots, with_fs):
-    body = ""
-    if with_fs:
-        for s in shots:
-            body += f"Sentence: {s['text']}\nSentiment: {SST2_VERBALIZER[s['label']]}\n\n"
-    return _SST2_INSTRUCTION + body + f"Sentence: {ex['text']}\nSentiment:"
+    fmt = lambda x: f"Sentence: {x['text']}\nSentiment: {SST2_V[x['label']]}"
+    body = ("\n\n".join(fmt(s) for s in shots) + "\n\n") if (with_fs and shots) else ""
+    return _SST2_INSTR + body + f"Sentence: {ex['text']}\nSentiment:"
 
 
 def _sst2_parse(text):
-    if text is None:
-        return None
+    if text is None: return None
     first = text.strip().split("\n")[0].lower()
     if "positive" in first: return "Positive"
     if "negative" in first: return "Negative"
@@ -132,57 +107,48 @@ SST2 = Task(
     load_data=_sst2_load,
     build_prompt=_sst2_prompt,
     parse_pred=_sst2_parse,
-    gold=lambda ex: SST2_VERBALIZER[ex["label"]],
-    score=lambda p, ex: p == SST2_VERBALIZER[ex["label"]],
+    gold=lambda ex: SST2_V[ex["label"]],
+    score=lambda p, ex: p == SST2_V[ex["label"]],
     sample_demos=make_balanced_sampler("label", 2),
     default_k_shots=4,
-    max_new_tokens=4,
+    max_new_tokens=5,
     recommended_max_seq_len=512,
     num_classes=2,
 )
 
 
-# =========================================================================== #
-#   MRPC — paraphrase (GLUE)                                                  #
-# =========================================================================== #
-MRPC_VERBALIZER = {0: "Not Equivalent", 1: "Equivalent"}
+# --- MRPC --------------------------------------------------------------------
+
+MRPC_V = {0: "Not Equivalent", 1: "Equivalent"}
 
 
 def _mrpc_load(cfg):
     from datasets import load_dataset
     ds = load_dataset("glue", "mrpc")
-    full = [{"sentence1": ex["sentence1"], "sentence2": ex["sentence2"],
-             "label": int(ex["label"])} for ex in ds["train"]]
+    full = [{"sentence1": ex["sentence1"], "sentence2": ex["sentence2"], "label": int(ex["label"])}
+            for ex in ds["train"]]
     by_c = {0: [], 1: []}
     for ex in full:
         by_c[ex["label"]].append(ex)
     per_class = max(1, cfg.n_train_pool // 2)
     demo_pool = by_c[0][:per_class] + by_c[1][:per_class]
-
-    n_calib_per_class = max(10, cfg.n_calib_pool // 2)
-    calib_pool = (by_c[0][per_class:per_class + n_calib_per_class]
-                  + by_c[1][per_class:per_class + n_calib_per_class])
-    rng = random.Random(42); rng.shuffle(calib_pool)
-
-    eval_set = [{"sentence1": ex["sentence1"], "sentence2": ex["sentence2"],
-                 "label": int(ex["label"])} for ex in ds["validation"]]
-    eval_set = eval_set[:min(cfg.n_eval, len(eval_set))]
-    return demo_pool, calib_pool, eval_set
+    n_cal_pc = max(10, cfg.n_calib_pool // 2)
+    calib_pool = by_c[0][per_class:per_class + n_cal_pc] + by_c[1][per_class:per_class + n_cal_pc]
+    random.Random(42).shuffle(calib_pool)
+    eval_set = [{"sentence1": ex["sentence1"], "sentence2": ex["sentence2"], "label": int(ex["label"])}
+                for ex in ds["validation"]]
+    return demo_pool, calib_pool, eval_set[:cfg.n_eval]
 
 
-_MRPC_INSTRUCTION = (
-    "Decide whether the two sentences are paraphrases (Equivalent) or not (Not Equivalent).\n"
-    "Answer with only the relationship label.\n\n"
-)
+_MRPC_INSTR = ("Decide whether the two sentences are paraphrases (Equivalent) or not (Not Equivalent).\n"
+               "Answer with only the relationship label.\n\n")
 
 
 def _mrpc_prompt(ex, shots, with_fs):
-    body = ""
-    if with_fs:
-        for s in shots:
-            body += (f"Sentence 1: {s['sentence1']}\nSentence 2: {s['sentence2']}\n"
-                     f"Relationship: {MRPC_VERBALIZER[s['label']]}\n\n")
-    return (_MRPC_INSTRUCTION + body
+    fmt = lambda x: (f"Sentence 1: {x['sentence1']}\nSentence 2: {x['sentence2']}\n"
+                     f"Relationship: {MRPC_V[x['label']]}")
+    body = ("\n\n".join(fmt(s) for s in shots) + "\n\n") if (with_fs and shots) else ""
+    return (_MRPC_INSTR + body
             + f"Sentence 1: {ex['sentence1']}\nSentence 2: {ex['sentence2']}\nRelationship:")
 
 
@@ -201,23 +167,22 @@ MRPC = Task(
     load_data=_mrpc_load,
     build_prompt=_mrpc_prompt,
     parse_pred=_mrpc_parse,
-    gold=lambda ex: MRPC_VERBALIZER[ex["label"]],
-    score=lambda p, ex: p == MRPC_VERBALIZER[ex["label"]],
+    gold=lambda ex: MRPC_V[ex["label"]],
+    score=lambda p, ex: p == MRPC_V[ex["label"]],
     sample_demos=make_balanced_sampler("label", 2),
     default_k_shots=4,
-    max_new_tokens=6,
-    recommended_max_seq_len=768,
+    max_new_tokens=8,
+    recommended_max_seq_len=512,
     num_classes=2,
 )
 
 
-# =========================================================================== #
-#   AG News — 4-class topic                                                   #
-# =========================================================================== #
-AG_NEWS_LABELS = ["World", "Sports", "Business", "Sci/Tech"]
+# --- AG News -----------------------------------------------------------------
+
+AG_LABELS = ["World", "Sports", "Business", "Sci/Tech"]
 
 
-def _ag_news_load(cfg):
+def _ag_load(cfg):
     from datasets import load_dataset
     ds = load_dataset("ag_news")
     full = [{"text": ex["text"].strip(), "label": int(ex["label"])} for ex in ds["train"]]
@@ -228,121 +193,126 @@ def _ag_news_load(cfg):
     demo_pool = []
     for c in range(4):
         demo_pool.extend(by_c[c][:per_class])
-
-    n_calib_per_class = max(10, cfg.n_calib_pool // 4)
+    n_cal_pc = max(10, cfg.n_calib_pool // 4)
     calib_pool = []
     for c in range(4):
-        calib_pool.extend(by_c[c][per_class:per_class + n_calib_per_class])
-    rng = random.Random(42); rng.shuffle(calib_pool)
-
+        calib_pool.extend(by_c[c][per_class:per_class + n_cal_pc])
+    random.Random(42).shuffle(calib_pool)
     eval_set = [{"text": ex["text"].strip(), "label": int(ex["label"])} for ex in ds["test"]]
-    eval_set = eval_set[:min(cfg.n_eval, len(eval_set))]
-    return demo_pool, calib_pool, eval_set
+    return demo_pool, calib_pool, eval_set[:cfg.n_eval]
 
 
-_AG_INSTRUCTION = (
-    "Classify the following news article into one of these topics: World, Sports, Business, Sci/Tech.\n"
-    "Answer with only the topic name.\n\n"
-)
+_AG_INSTR = ("You are a news topic classifier. "
+             "Classify the following news article into exactly one of these labels: "
+             "World, Sports, Business, Sci/Tech.\n"
+             "Answer with only the label name.\n\n")
 
 
 def _ag_prompt(ex, shots, with_fs):
-    body = ""
-    if with_fs:
-        for s in shots:
-            body += f"Article: {s['text']}\nTopic: {AG_NEWS_LABELS[s['label']]}\n\n"
-    return _AG_INSTRUCTION + body + f"Article: {ex['text']}\nTopic:"
-
-
-_AG_SYNONYMS = {
-    "World": ["world", "international", "politics"],
-    "Sports": ["sports", "sport"],
-    "Business": ["business", "finance", "economy"],
-    "Sci/Tech": ["sci/tech", "sci-tech", "science", "technology", "tech"],
-}
+    fmt = lambda x: f"Article: {x['text'].strip()}\nTopic: {AG_LABELS[x['label']]}"
+    body = ("\n\n".join(fmt(s) for s in shots) + "\n\n") if (with_fs and shots) else ""
+    return _AG_INSTR + body + f"Article: {ex['text'].strip()}\nTopic:"
 
 
 def _ag_parse(text):
+    # robust to "science and tech", "sci-tech", etc.
     if text is None: return None
-    first = text.strip().split("\n")[0].lower()
-    for label, syns in _AG_SYNONYMS.items():
-        for s in syns:
-            if s in first:
-                return label
+    t = text.lower().strip().replace("-", " ").replace("/", " / ").replace("&", " and ")
+    t = " ".join(t.split())
+    if ("sci" in t and "tech" in t) or "science" in t or "technology" in t:
+        return "Sci/Tech"
+    if "world" in t or "international" in t: return "World"
+    if "sport" in t: return "Sports"
+    if "business" in t or "finance" in t or "econom" in t: return "Business"
     return None
 
 
 AG_NEWS = Task(
     name="ag_news",
-    load_data=_ag_news_load,
+    load_data=_ag_load,
     build_prompt=_ag_prompt,
     parse_pred=_ag_parse,
-    gold=lambda ex: AG_NEWS_LABELS[ex["label"]],
-    score=lambda p, ex: p == AG_NEWS_LABELS[ex["label"]],
+    gold=lambda ex: AG_LABELS[ex["label"]],
+    score=lambda p, ex: p == AG_LABELS[ex["label"]],
     sample_demos=make_balanced_sampler("label", 4),
-    default_k_shots=4,
-    max_new_tokens=6,
+    default_k_shots=6,
+    max_new_tokens=5,
     recommended_max_seq_len=1024,
     num_classes=4,
 )
 
 
-# =========================================================================== #
-#   DBPedia-14 — 14-class topic                                               #
-# =========================================================================== #
-DBPEDIA_LABELS = [
-    "Company", "EducationalInstitution", "Artist", "Athlete", "OfficeHolder",
-    "MeanOfTransportation", "Building", "NaturalPlace", "Village", "Animal",
-    "Plant", "Album", "Film", "WrittenWork",
+# --- DBPedia-14 --------------------------------------------------------------
+
+# NOTE: keep the labels space-separated (e.g. "Educational Institution" not
+# "EducationalInstitution"). Models produce the spaced version and we had a
+# bug for a while where the parser only matched the concatenated string.
+DBP_LABELS = [
+    "Company", "Educational Institution", "Artist", "Athlete", "Office Holder",
+    "Mean of Transportation", "Building", "Natural Place", "Village", "Animal",
+    "Plant", "Album", "Film", "Written Work",
 ]
+DBP_MAX_CONTENT = 100  # truncate long Wikipedia summaries
 
 
 def _dbp_load(cfg):
     from datasets import load_dataset
     ds = load_dataset("dbpedia_14")
-    full = [{"content": ex["content"].strip(), "label": int(ex["label"])} for ex in ds["train"]]
-    by_c = {i: [] for i in range(14)}
+
+    def norm(ex):
+        return {"title": (ex.get("title") or "").strip(),
+                "content": ex["content"].strip()[:DBP_MAX_CONTENT],
+                "label": int(ex["label"])}
+
+    full = [norm(ex) for ex in ds["train"]]
+    by_class = {c: [] for c in range(14)}
     for ex in full:
-        by_c[ex["label"]].append(ex)
+        by_class[ex["label"]].append(ex)
+
     per_class = max(1, cfg.n_train_pool // 14)
     demo_pool = []
     for c in range(14):
-        demo_pool.extend(by_c[c][:per_class])
+        demo_pool.extend(by_class[c][:per_class])
 
-    n_calib_per_class = max(5, cfg.n_calib_pool // 14)
+    # Empirically need a bit more headroom per class on dbpedia.
+    per_class_cal = max(5, cfg.n_calib_pool // 14 + 5)
     calib_pool = []
     for c in range(14):
-        calib_pool.extend(by_c[c][per_class:per_class + n_calib_per_class])
-    rng = random.Random(42); rng.shuffle(calib_pool)
+        calib_pool.extend(by_class[c][per_class:per_class + per_class_cal])
+    random.Random(42).shuffle(calib_pool)
 
-    eval_set = [{"content": ex["content"].strip(), "label": int(ex["label"])} for ex in ds["test"]]
-    eval_set = eval_set[:min(cfg.n_eval, len(eval_set))]
+    eval_set = [norm(ex) for ex in ds["test"]][:cfg.n_eval]
     return demo_pool, calib_pool, eval_set
 
 
-_DBP_INSTRUCTION = (
-    "Classify the following text into one of these 14 DBPedia categories:\n"
-    "Company, EducationalInstitution, Artist, Athlete, OfficeHolder, MeanOfTransportation,\n"
-    "Building, NaturalPlace, Village, Animal, Plant, Album, Film, WrittenWork.\n"
-    "Answer with only the category name.\n\n"
-)
+_DBP_INSTR = ("You are a topic classifier. "
+              "Classify each text into exactly one of these categories: "
+              "Company, Educational Institution, Artist, Athlete, Office Holder, "
+              "Mean of Transportation, Building, Natural Place, Village, Animal, "
+              "Plant, Album, Film, Written Work.\n"
+              "Answer with only the category name.\n\n")
 
 
 def _dbp_prompt(ex, shots, with_fs):
-    body = ""
-    if with_fs:
-        for s in shots:
-            body += f"Text: {s['content']}\nCategory: {DBPEDIA_LABELS[s['label']]}\n\n"
-    return _DBP_INSTRUCTION + body + f"Text: {ex['content']}\nCategory:"
+    def fmt(x):
+        title = x.get("title", "").strip()
+        content = x["content"].strip()[:DBP_MAX_CONTENT]
+        head = f"Title: {title}\n" if title else ""
+        return f"{head}Text: {content}\nCategory: {DBP_LABELS[x['label']]}"
+    body = ("\n\n".join(fmt(s) for s in shots) + "\n\n") if (with_fs and shots) else ""
+    title = ex.get("title", "").strip()
+    head = f"Title: {title}\n" if title else ""
+    content = ex["content"].strip()[:DBP_MAX_CONTENT]
+    return _DBP_INSTR + body + f"{head}Text: {content}\nCategory:"
 
 
 def _dbp_parse(text):
+    # longest first so "Educational Institution" wins over "Institution"
     if text is None: return None
-    first = text.strip().split("\n")[0]
-    # Greedy: try exact match first, then case-insensitive substring
-    for label in DBPEDIA_LABELS:
-        if label.lower() in first.lower():
-            return label
+    first = text.strip().split("\n")[0].lower()
+    for lab in sorted(DBP_LABELS, key=len, reverse=True):
+        if lab.lower() in first:
+            return lab
     return None
 
 
@@ -351,59 +321,67 @@ DBPEDIA = Task(
     load_data=_dbp_load,
     build_prompt=_dbp_prompt,
     parse_pred=_dbp_parse,
-    gold=lambda ex: DBPEDIA_LABELS[ex["label"]],
-    score=lambda p, ex: p == DBPEDIA_LABELS[ex["label"]],
+    gold=lambda ex: DBP_LABELS[ex["label"]],
+    score=lambda p, ex: p == DBP_LABELS[ex["label"]],
     sample_demos=make_balanced_sampler("label", 14),
-    default_k_shots=4,
-    max_new_tokens=12,
+    default_k_shots=14,
+    max_new_tokens=10,
     recommended_max_seq_len=1024,
     num_classes=14,
 )
 
 
-# =========================================================================== #
-#   BoolQ — yes/no                                                            #
-# =========================================================================== #
-BOOLQ_VERBALIZER = {False: "No", True: "Yes"}
+# --- BoolQ -------------------------------------------------------------------
+
+BOOLQ_V = {0: "No", 1: "Yes"}
 
 
 def _boolq_load(cfg):
     from datasets import load_dataset
-    ds = load_dataset("boolq")
-    full = [{"question": ex["question"], "passage": ex["passage"],
-             "label": bool(ex["answer"])} for ex in ds["train"]]
-    by_c = {True: [], False: []}
+    try:
+        ds = load_dataset("super_glue", "boolq")
+    except Exception:
+        # HF has been flaky on this mirror; try the aps fork
+        ds = load_dataset("aps/super_glue", "boolq")
+
+    def norm(ex):
+        return {"passage": ex["passage"].strip(),
+                "question": ex["question"].strip(),
+                "label": int(ex["label"])}
+
+    full = [norm(ex) for ex in ds["train"]]
+    by_class = {0: [], 1: []}
     for ex in full:
-        by_c[ex["label"]].append(ex)
-    per_class = max(1, cfg.n_train_pool // 2)
-    demo_pool = by_c[True][:per_class] + by_c[False][:per_class]
+        by_class[ex["label"]].append(ex)
 
-    n_calib_per_class = max(10, cfg.n_calib_pool // 2)
-    calib_pool = (by_c[True][per_class:per_class + n_calib_per_class]
-                  + by_c[False][per_class:per_class + n_calib_per_class])
-    rng = random.Random(42); rng.shuffle(calib_pool)
+    per_demo = max(1, cfg.n_train_pool // 2)
+    per_cal = max(10, cfg.n_calib_pool // 2)
+    demo_pool, calib_pool = [], []
+    for c in (0, 1):
+        demo_pool.extend(by_class[c][:per_demo])
+        calib_pool.extend(by_class[c][per_demo:per_demo + per_cal])
+    random.Random(42).shuffle(calib_pool)
 
-    eval_set = [{"question": ex["question"], "passage": ex["passage"],
-                 "label": bool(ex["answer"])} for ex in ds["validation"]]
-    eval_set = eval_set[:min(cfg.n_eval, len(eval_set))]
+    eval_set = [norm(ex) for ex in ds["validation"] if ex["label"] != -1][:cfg.n_eval]
     return demo_pool, calib_pool, eval_set
 
 
+_BOOLQ_INSTR = "Read the passage and answer the question with 'Yes' or 'No'.\n\n"
+
+
 def _boolq_prompt(ex, shots, with_fs):
-    instr = "Answer the question Yes or No based on the passage.\n\n"
-    body = ""
-    if with_fs:
-        for s in shots:
-            body += (f"Passage: {s['passage']}\nQuestion: {s['question']}\n"
-                     f"Answer: {BOOLQ_VERBALIZER[s['label']]}\n\n")
-    return instr + body + f"Passage: {ex['passage']}\nQuestion: {ex['question']}\nAnswer:"
+    fmt = lambda x: (f"Passage: {x['passage']}\nQuestion: {x['question']}\n"
+                     f"Answer: {BOOLQ_V[x['label']]}")
+    body = ("\n\n".join(fmt(s) for s in shots) + "\n\n") if (with_fs and shots) else ""
+    return (_BOOLQ_INSTR + body
+            + f"Passage: {ex['passage']}\nQuestion: {ex['question']}\nAnswer:")
 
 
 def _boolq_parse(text):
     if text is None: return None
     first = text.strip().split("\n")[0].lower()
-    if "yes" in first.split()[:3]: return "Yes"
-    if "no" in first.split()[:3]: return "No"
+    if "yes" in first or "true" in first: return "Yes"
+    if "no" in first or "false" in first: return "No"
     return None
 
 
@@ -412,58 +390,90 @@ BOOLQ = Task(
     load_data=_boolq_load,
     build_prompt=_boolq_prompt,
     parse_pred=_boolq_parse,
-    gold=lambda ex: BOOLQ_VERBALIZER[ex["label"]],
-    score=lambda p, ex: p == BOOLQ_VERBALIZER[ex["label"]],
-    sample_demos=lambda pool, k, rng, example=None: make_balanced_sampler(
-        "label", 2)([{**e, "label": int(e["label"])} for e in pool], k, rng, example),
-    default_k_shots=4,
+    gold=lambda ex: BOOLQ_V[ex["label"]],
+    score=lambda p, ex: p == BOOLQ_V[ex["label"]],
+    sample_demos=make_balanced_sampler("label", 2),
+    default_k_shots=2,  # passages are long, more shots blows the context
     max_new_tokens=4,
     recommended_max_seq_len=1536,
     num_classes=2,
 )
 
 
-# =========================================================================== #
-#   ARC-Challenge — 4-way multiple choice                                     #
-# =========================================================================== #
+# --- ARC-Challenge -----------------------------------------------------------
+
+ARC_LABELS = {0: "A", 1: "B", 2: "C", 3: "D"}
+ARC_LAB2IDX = {v: k for k, v in ARC_LABELS.items()}
+_ARC_RE = re.compile(r"\b([ABCD])\b")
+
+
+def _arc_normalize(ex):
+    """Drop any row that isn't a clean 4-choice question."""
+    labels = list(ex["choices"]["label"])
+    texts = list(ex["choices"]["text"])
+    if len(labels) != 4 or len(texts) != 4:
+        return None
+    ans = ex["answerKey"]
+    if ans in ARC_LAB2IDX:
+        idx = ARC_LAB2IDX[ans]
+    elif isinstance(ans, str) and ans.isdigit() and 1 <= int(ans) <= 4:
+        idx = int(ans) - 1
+    elif ans in labels:
+        idx = labels.index(ans)
+    else:
+        return None
+    return {"question": ex["question"].strip(), "choices": texts, "label": idx}
+
+
 def _arc_load(cfg):
     from datasets import load_dataset
-    ds = load_dataset("allenai/ai2_arc", "ARC-Challenge")
-    def _norm(ex):
-        return {
-            "question": ex["question"],
-            "choices": ex["choices"]["text"],
-            "labels": ex["choices"]["label"],
-            "answer": ex["answerKey"],
-        }
-    full_train = [_norm(ex) for ex in ds["train"]]
-    demo_pool = full_train[:cfg.n_train_pool]
-    calib_pool = full_train[cfg.n_train_pool:cfg.n_train_pool + cfg.n_calib_pool]
-    eval_set = [_norm(ex) for ex in ds["validation"]]
-    eval_set = eval_set[:min(cfg.n_eval, len(eval_set))]
-    return demo_pool, calib_pool, eval_set
+    ds = load_dataset("ai2_arc", "ARC-Challenge")
+
+    def take(split):
+        out = []
+        for ex in ds[split]:
+            n = _arc_normalize(ex)
+            if n is not None:
+                out.append(n)
+        return out
+
+    train = take("train") + take("validation")
+    test = take("test")
+    rng = random.Random(42)
+    rng.shuffle(train); rng.shuffle(test)
+
+    by_label = {c: [] for c in range(4)}
+    for ex in train:
+        by_label[ex["label"]].append(ex)
+
+    per_demo = max(1, cfg.n_train_pool // 4)
+    per_cal = max(5, cfg.n_calib_pool // 4)
+    demo_pool, calib_pool = [], []
+    for c in range(4):
+        demo_pool.extend(by_label[c][:per_demo])
+        calib_pool.extend(by_label[c][per_demo:per_demo + per_cal])
+    return demo_pool, calib_pool, test[:cfg.n_eval]
 
 
-def _arc_format_choices(ex):
-    return "\n".join(f"{l}. {t}" for l, t in zip(ex["labels"], ex["choices"]))
+_ARC_INSTR = ("Answer the following multiple-choice science question.\n"
+              "Reply with only the single letter (A, B, C, or D) of the correct answer.\n\n")
 
 
 def _arc_prompt(ex, shots, with_fs):
-    instr = "Answer the multiple-choice science question with the letter of the correct choice.\n\n"
-    body = ""
-    if with_fs:
-        for s in shots:
-            body += (f"Question: {s['question']}\n{_arc_format_choices(s)}\n"
-                     f"Answer: {s['answer']}\n\n")
-    return instr + body + f"Question: {ex['question']}\n{_arc_format_choices(ex)}\nAnswer:"
-
-
-_ARC_LETTER_RE = re.compile(r"\b([A-E1-5])\b")
+    def fmt(x):
+        c = x["choices"]
+        return (f"Question: {x['question']}\nA. {c[0]}\nB. {c[1]}\nC. {c[2]}\nD. {c[3]}\n"
+                f"Answer: {ARC_LABELS[x['label']]}")
+    body = ("\n\n".join(fmt(s) for s in shots) + "\n\n") if (with_fs and shots) else ""
+    c = ex["choices"]
+    return (_ARC_INSTR + body
+            + f"Question: {ex['question']}\nA. {c[0]}\nB. {c[1]}\nC. {c[2]}\nD. {c[3]}\nAnswer:")
 
 
 def _arc_parse(text):
     if text is None: return None
-    m = _ARC_LETTER_RE.search(text.strip())
+    first = text.strip().split("\n")[0]
+    m = _ARC_RE.search(first.upper())
     return m.group(1) if m else None
 
 
@@ -472,29 +482,29 @@ ARC_CHALLENGE = Task(
     load_data=_arc_load,
     build_prompt=_arc_prompt,
     parse_pred=_arc_parse,
-    gold=lambda ex: ex["answer"],
-    score=lambda p, ex: p == ex["answer"],
-    sample_demos=random_sampler,
+    gold=lambda ex: ARC_LABELS[ex["label"]],
+    score=lambda p, ex: p == ARC_LABELS[ex["label"]],
+    sample_demos=make_balanced_sampler("label", 4),
     default_k_shots=4,
     max_new_tokens=4,
     recommended_max_seq_len=1024,
-    num_classes=None,
+    num_classes=4,
 )
 
 
-# =========================================================================== #
-#   GSM8K — grade-school math (CoT)                                           #
-# =========================================================================== #
-_GSM_NUM_RE = re.compile(r"(-?\d+(?:,\d{3})*(?:\.\d+)?)")
+# --- GSM8K -------------------------------------------------------------------
+
+_GSM_NUM = re.compile(r"(-?\d+(?:,\d{3})*(?:\.\d+)?)")
 
 
-def _gsm_extract_number(text):
+def _gsm_extract(text):
+    # last number wins (the answer typically appears after "#### ")
     if text is None: return None
-    matches = _GSM_NUM_RE.findall(text.replace("$", ""))
-    return matches[-1].replace(",", "") if matches else None
+    nums = _GSM_NUM.findall(text.replace("$", ""))
+    return nums[-1].replace(",", "") if nums else None
 
 
-# Canonical 8 GSM8K CoT exemplars from Wei et al. 2022, Appendix G
+# Wei et al. canonical 8 CoT shots.
 GSM_CANONICAL_8 = [
     {"question": "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
      "answer": "There are 15 trees originally. Then there were 21 trees after some more were planted. So there must have been 21 - 15 = 6.\n#### 6"},
@@ -518,115 +528,141 @@ GSM_CANONICAL_8 = [
 def _gsm_load(cfg):
     from datasets import load_dataset
     test = list(load_dataset("gsm8k", "main", split=f"test[:{cfg.n_eval}]"))
-    n_calib = cfg.n_calib_pool
+    n_cal = cfg.n_calib_pool
     if getattr(cfg, "use_canonical_demos", True):
         demo_pool = list(GSM_CANONICAL_8)
-        calib_pool = list(load_dataset("gsm8k", "main", split=f"train[:{n_calib}]"))
+        calib_pool = list(load_dataset("gsm8k", "main", split=f"train[:{n_cal}]"))
     else:
         n_demo = cfg.n_train_pool
-        full = list(load_dataset("gsm8k", "main", split=f"train[:{n_demo+n_calib}]"))
-        demo_pool = sorted(full[:n_demo],
-                           key=lambda ex: (len(ex["answer"]), len(ex["question"])))
+        full = list(load_dataset("gsm8k", "main", split=f"train[:{n_demo + n_cal}]"))
+        # sort by length so short ones go first into the demo pool
+        demo_pool = sorted(full[:n_demo], key=lambda ex: (len(ex["answer"]), len(ex["question"])))
         calib_pool = full[n_demo:]
     return demo_pool, calib_pool, test
 
 
 def _gsm_prompt(ex, shots, with_fs):
-    """CoT chat-style prompt; works for Mistral-Instruct, Phi-3, Gemma-it."""
-    def fmt_shot(s):
-        return f"Question: {s['question']}\nSolution: {s['answer']}\n\n"
-    instr = "Solve the math problem step by step. End with '#### <answer>'.\n\n"
-    body = ""
-    if with_fs:
-        for s in shots:
-            body += fmt_shot(s)
-    # Use [INST] wrapper for Mistral-Instruct compatibility — Phi/Gemma accept it
-    return f"[INST] {instr}{body}Question: {ex['question']}\nSolution: [/INST]"
-
-
-def _gsm_parse(text):
-    if text is None: return None
-    return _gsm_extract_number(text)
-
-
-def _gsm_score(pred, ex):
-    gold = _gsm_extract_number(ex["answer"])
-    if pred is None or gold is None: return False
-    try:
-        return abs(float(pred) - float(gold)) < 1e-4
-    except ValueError:
-        return False
+    fmt = lambda x: f"Question: {x['question'].strip()}\nSolution: {x['answer'].strip()}"
+    if with_fs and shots:
+        block = "\n\n".join(fmt(s) for s in shots)
+        return (f"[INST] Solve math word problems step by step. "
+                f"At the end write the answer as: #### <number>\n\n"
+                f"Here are some solved examples:\n\n{block}\n\n"
+                f"Now solve this:\nQuestion: {ex['question'].strip()}\nSolution: [/INST]")
+    return (f"[INST] Solve the following math word problem step by step. "
+            f"At the end write the answer as: #### <number>\n\n"
+            f"Question: {ex['question'].strip()}\nSolution: [/INST]")
 
 
 GSM8K = Task(
     name="gsm8k",
     load_data=_gsm_load,
     build_prompt=_gsm_prompt,
-    parse_pred=_gsm_parse,
-    gold=lambda ex: _gsm_extract_number(ex["answer"]) or "",
-    score=_gsm_score,
+    parse_pred=_gsm_extract,
+    gold=lambda ex: _gsm_extract(ex["answer"]),
+    score=lambda p, ex: p is not None and p == _gsm_extract(ex["answer"]),
     sample_demos=canonical_first_sampler,
     default_k_shots=8,
     canonical_demos=GSM_CANONICAL_8,
     max_new_tokens=256,
-    recommended_max_seq_len=1536,
+    recommended_max_seq_len=2048,
     num_classes=None,
 )
 
 
-# =========================================================================== #
-#   MMLU — 5-shot, n=500 subject-matched (Hendrycks protocol)                #
-# =========================================================================== #
+# --- MMLU --------------------------------------------------------------------
+
+MMLU_LABELS = {0: "A", 1: "B", 2: "C", 3: "D"}
+_MMLU_RE = re.compile(r"\b([ABCD])\b", re.IGNORECASE)
+
+# Hendrycks protocol uses subject-matched dev shots. We cache the dev set
+# grouped by subject in this module-level dict (populated by _mmlu_load).
+# TODO: this is ugly global state. Should pass via cfg.
+_MMLU_DEV_BY_SUBJECT = {}
+
+
+def _mmlu_normalize(ex):
+    ans = ex["answer"]
+    if isinstance(ans, str):
+        ans = {"A": 0, "B": 1, "C": 2, "D": 3}[ans.strip().upper()]
+    return {"question": ex["question"].strip(),
+            "choices": list(ex["choices"]),
+            "label": int(ans),
+            "subject": ex.get("subject", "general")}
+
+
 def _mmlu_load(cfg):
     from datasets import load_dataset
-    # 'all' config gives the standard joint MMLU.
     ds = load_dataset("cais/mmlu", "all")
-    def _norm(ex):
-        return {
-            "question": ex["question"],
-            "choices": ex["choices"],
-            "subject": ex["subject"],
-            "answer": int(ex["answer"]),
-        }
-    dev = [_norm(ex) for ex in ds["dev"]]    # used as demos (5-shot in paper)
-    val = [_norm(ex) for ex in ds["validation"]]
-    test = [_norm(ex) for ex in ds["test"]]
-    # demo_pool = dev set (Hendrycks's 5-shot demo source)
-    demo_pool = dev
-    calib_pool = val[:cfg.n_calib_pool]
-    eval_set = test[:min(cfg.n_eval, len(test))]
-    return demo_pool, calib_pool, eval_set
+    dev_rows = [_mmlu_normalize(ex) for ex in ds["dev"]]
+
+    global _MMLU_DEV_BY_SUBJECT
+    _MMLU_DEV_BY_SUBJECT = {}
+    for ex in dev_rows:
+        _MMLU_DEV_BY_SUBJECT.setdefault(ex["subject"], []).append(ex)
+
+    val_rows = [_mmlu_normalize(ex) for ex in ds["validation"]]
+    random.Random(42).shuffle(val_rows)
+
+    by_label = {c: [] for c in range(4)}
+    for ex in val_rows:
+        by_label[ex["label"]].append(ex)
+    calib_pool = []
+    per = max(1, cfg.n_calib_pool // 4)
+    for c in range(4):
+        calib_pool.extend(by_label[c][:per])
+    random.Random(42).shuffle(calib_pool)
+
+    test_rows = [_mmlu_normalize(ex) for ex in ds["test"]]
+    random.Random(42).shuffle(test_rows)
+    return dev_rows, calib_pool, test_rows[:cfg.n_eval]
 
 
-def _mmlu_format_choices(ex):
-    letters = ["A", "B", "C", "D"]
-    return "\n".join(f"{l}. {c}" for l, c in zip(letters, ex["choices"]))
-
-
-def _mmlu_subject_matched_shots(demo_pool, k, rng, example=None):
-    """Hendrycks 5-shot subject-matched: pick k demos with the same subject."""
-    if example is not None and "subject" in example:
-        same = [d for d in demo_pool if d["subject"] == example["subject"]]
-        if len(same) >= k:
-            return rng.sample(same, k)
-    return rng.sample(demo_pool, k=min(k, len(demo_pool)))
+def _mmlu_subject_sampler(train_pool, k, rng, example=None):
+    """Hendrycks 5-shot: prefer dev examples from the same subject as the query."""
+    if example is not None:
+        subj = example.get("subject", "")
+        pool = _MMLU_DEV_BY_SUBJECT.get(subj, [])
+        if pool:
+            shots = pool[:k]
+            if len(shots) == k:
+                return shots
+            # not enough in-subject — pad with random out-of-subject
+            others = [ex for ex in train_pool if ex.get("subject") != subj]
+            rng.shuffle(others)
+            return shots + others[:k - len(shots)]
+    # fallback: balanced by label
+    by_label = {c: [] for c in range(4)}
+    for ex in train_pool:
+        by_label[ex["label"]].append(ex)
+    base, rem = k // 4, k % 4
+    shots = []
+    for i, c in enumerate(range(4)):
+        take = base + (1 if i < rem else 0)
+        pool = by_label[c][:]
+        rng.shuffle(pool)
+        shots.extend(pool[:take])
+    return shots
 
 
 def _mmlu_prompt(ex, shots, with_fs):
-    instr = (f"The following are multiple choice questions (with answers) about "
-             f"{ex.get('subject', 'various subjects')}.\n\n")
-    body = ""
-    if with_fs:
-        for s in shots:
-            body += (f"{s['question']}\n{_mmlu_format_choices(s)}\n"
-                     f"Answer: {chr(ord('A') + s['answer'])}\n\n")
-    return instr + body + f"{ex['question']}\n{_mmlu_format_choices(ex)}\nAnswer:"
+    subject = ex.get("subject", "general").replace("_", " ")
+    instr = f"The following are multiple choice questions (with answers) about {subject}.\n\n"
+    def fmt(x):
+        c = x["choices"]
+        return (f"Question: {x['question']}\nA. {c[0]}\nB. {c[1]}\nC. {c[2]}\nD. {c[3]}\n"
+                f"Answer: {MMLU_LABELS[x['label']]}")
+    body = ("\n\n".join(fmt(s) for s in shots) + "\n\n") if (with_fs and shots) else ""
+    c = ex["choices"]
+    return (instr + body
+            + f"Question: {ex['question']}\nA. {c[0]}\nB. {c[1]}\nC. {c[2]}\nD. {c[3]}\nAnswer:")
 
 
 def _mmlu_parse(text):
     if text is None: return None
-    m = re.search(r"\b([A-D])\b", text.strip())
-    return m.group(1) if m else None
+    first = text.strip().split("\n")[0]
+    m = _MMLU_RE.search(first.upper())
+    return m.group(1).upper() if m else None
 
 
 MMLU = Task(
@@ -634,20 +670,20 @@ MMLU = Task(
     load_data=_mmlu_load,
     build_prompt=_mmlu_prompt,
     parse_pred=_mmlu_parse,
-    gold=lambda ex: chr(ord("A") + ex["answer"]),
-    score=lambda p, ex: p == chr(ord("A") + ex["answer"]),
-    sample_demos=_mmlu_subject_matched_shots,
+    gold=lambda ex: MMLU_LABELS[ex["label"]],
+    score=lambda p, ex: p == MMLU_LABELS[ex["label"]],
+    sample_demos=_mmlu_subject_sampler,
     default_k_shots=5,
+    canonical_demos=None,
     max_new_tokens=4,
-    recommended_max_seq_len=1024,
-    num_classes=None,
+    recommended_max_seq_len=2048,
+    num_classes=4,
 )
 
 
-# =========================================================================== #
-#   Registry                                                                  #
-# =========================================================================== #
-TASKS: Dict[str, Task] = {
+# --- registry ----------------------------------------------------------------
+
+TASKS = {
     "sst2": SST2,
     "mrpc": MRPC,
     "ag_news": AG_NEWS,
@@ -659,14 +695,7 @@ TASKS: Dict[str, Task] = {
 }
 
 
-def get_task(name: str) -> Task:
+def get_task(name):
     if name not in TASKS:
-        raise KeyError(f"Unknown task {name!r}. Available: {list(TASKS)}")
+        raise KeyError(f"unknown task {name!r}. options: {list(TASKS)}")
     return TASKS[name]
-
-
-def effective_k_shots(cfg, task: Task) -> int:
-    """Return cfg.k_shots if explicitly set, else the task's default."""
-    if cfg.k_shots is not None:
-        return cfg.k_shots
-    return task.default_k_shots
