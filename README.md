@@ -12,7 +12,7 @@ T4 needs `device_map="auto"` and runs slowly (~3-4h per task).
 
 ## Layout
 ```
-pcc/                core package
+icc/                core package
   config.py         MODELS dict, ExperimentConfig
   model_io.py       load + o_proj snapshot/restore
   tasks.py          8 tasks: sst2, mrpc, ag_news, dbpedia_14, boolq, arc_challenge, gsm8k, mmlu
@@ -70,7 +70,7 @@ those and dumps LaTeX fragments to `runs/latex_fragments/`.
 |---|---|---|
 | `mu` (ridge anchor) | 1e-2 | `config.ExperimentConfig` |
 | `alpha` (blend) | 0.8 | same |
-| p sweep | {0.05, 0.10, …, 0.40} | `config.DEFAULT_P_GRID` |
+| p sweep | {0.05, 0.10, …, 0.35} | `config.DEFAULT_P_GRID` |
 | n_calib | task-dependent | `experiments/main_results.TASK_DEFAULTS` |
 
 The `n_calib` defaults in `main_results.py` are what's been used in the paper

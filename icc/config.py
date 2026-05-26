@@ -27,8 +27,7 @@ MODELS = {
 }
 
 
-# Sweep grid. We extended to 0.40 once Gemma BoolQ wanted 0.35.
-DEFAULT_P_GRID = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40)
+DEFAULT_P_GRID = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35)
 
 
 @dataclass

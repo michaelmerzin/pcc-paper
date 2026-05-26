@@ -1,195 +1,196 @@
-"""Cross-fit auto-sparsity selector (X-Delta-CAP).
+"""No-sweep auto-sparsity experiment runner."""
+import argparse
+import json
+import os
+import sys
 
-For each o_proj row, fit the ridge on one fold of the calibration pool
-and measure held-out R^2 on the other. Score each row by
-max(0, R^2) * Var(delta) and keep the shortest prefix covering
-`cumulative_target` of the total score, subject to:
-  - late-layer restriction (l >= L // 2)
-  - sparsity clamp p in [P_MIN, P_MAX]
-  - per-layer cap LAYER_CAP_FRAC * d rows
-
-Matches Section 3.3 of the paper.
-"""
-import random
-from typing import Dict, List, Tuple
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-
-# Hyperparameters from the paper.
-P_MIN = 0.05
-P_MAX = 0.3
-LAYER_CAP_FRAC = 0.65
-CUMULATIVE_TARGET = 0.90
-
-
-def _ridge_solve_chunk(H_fit: torch.Tensor, Y_fit_chunk: torch.Tensor,
-                       mu: float) -> torch.Tensor:
-    """Solve (H^T H + mu I) X = H^T Y for a chunk of output columns."""
-    A = H_fit.T @ H_fit
-    A.diagonal().add_(float(mu))
-    B = H_fit.T @ Y_fit_chunk
-
-    try:
-        chol = torch.linalg.cholesky(A)
-    except Exception:
-        A.diagonal().add_(1e-3)
-        chol = torch.linalg.cholesky(A)
-
-    X = torch.cholesky_solve(B, chol)
-    return X.T  # shape: (chunk, d)
+from icc.auto_sparsity import auto_select_rows_xdelta
+from icc.config import ExperimentConfig, MODELS
+from icc.edit import apply_edit
+from icc.eval_engine import evaluate, build_shots_per_example, build_correction_set
+from icc.model_io import load_model_and_tokenizer, snapshot_o_proj, restore_o_proj
+from icc.sensitivity import collect_calibration_tensors
+from icc.tasks import get_task, effective_k_shots, TASKS
 
 
-def auto_select_rows_xdelta(
-    H_NS: Dict[int, torch.Tensor],
-    Z_FS: Dict[int, torch.Tensor],
-    W0: Dict[int, torch.Tensor],
-    num_layers: int,
-    hidden_size: int,
-    mu: float,
-    cumulative_target: float = CUMULATIVE_TARGET,
-    chunk_rows: int = 512,
-    seed: int = 0,
-    device: str = "cuda",
-    verbose: bool = False,
-) -> Tuple[List[Tuple[int, int]], float, Dict[Tuple[int, int], float]]:
-    """Cross-fit selector matching the paper.
+TASK_DEFAULTS = {
+    "ag_news":       dict(n_eval=872, n_train_pool=128, n_calib_pool=500, bs_eval=4, max_seq_len=1024),
+    "dbpedia_14":    dict(n_eval=872, n_train_pool=126, n_calib_pool=560, bs_eval=4, max_seq_len=1024),
+    "sst2":          dict(n_eval=872, n_train_pool=100, n_calib_pool=500, bs_eval=4, max_seq_len=512),
+    "mrpc":          dict(n_eval=408, n_train_pool=100, n_calib_pool=400, bs_eval=4, max_seq_len=512),
+    "gsm8k":         dict(n_eval=150, n_train_pool=128, n_calib_pool=500, bs_eval=1, max_seq_len=1024),
+    "boolq":         dict(n_eval=872, n_train_pool=100, n_calib_pool=400, bs_eval=2, max_seq_len=1536),
+    "arc_challenge": dict(n_eval=500, n_train_pool=120, n_calib_pool=300, bs_eval=2, max_seq_len=1024),
+    "mmlu":          dict(n_eval=500, n_train_pool=285, n_calib_pool=500, bs_eval=1, max_seq_len=2048),
+}
 
-    Returns:
-        selected: list of (layer, row) pairs
-        p_star:   selected_count / (L * d)
-        R2_map:   {(layer, row): score} for diagnostics
-    """
-    L = int(num_layers)
-    d = int(hidden_size)
 
-    # ----- 1. derive observed deltas -----
-    # Z_FS is the with-context o_proj output; H_NS @ W0^T is the no-context
-    # output, so delta = Z_FS - (H_NS @ W0^T).
-    Z_NS = {}
-    for l in range(L):
-        if l in H_NS and l in W0:
-            Z_NS[l] = (H_NS[l].float() @ W0[l].float().T).cpu()
+def _recovery_pct(ns_acc, fs_acc, auto_acc):
+    denom = fs_acc - ns_acc
+    if abs(denom) < 1e-8:
+        return 0.0
+    return 100.0 * (auto_acc - ns_acc) / denom
 
-    # ----- 2. score rows on late layers only -----
-    layers_to_use = list(range(L // 2, L))
 
-    all_rows: List[Tuple[float, int, int]] = []
-    per_layer_total_score: Dict[int, float] = {}
+def run_one_task(model, tok, cfg, weights_snapshot, fs_seed, cumulative_target):
+    task = get_task(cfg.task_key)
+    k = effective_k_shots(cfg, task)
+    cfg.max_seq_len = cfg.max_seq_len or task.recommended_max_seq_len
 
-    for l in layers_to_use:
-        if l not in H_NS or l not in Z_FS or l not in Z_NS:
-            continue
+    use_canon = (
+        task.canonical_demos is not None
+        and k == len(task.canonical_demos)
+        and cfg.use_canonical_demos
+    )
 
-        H = H_NS[l].float()
-        Y = (Z_FS[l].float() - Z_NS[l].float())  # observed delta, shape (m, d)
-        m, d_check = H.shape
-        assert d_check == d, (d_check, d)
+    demo_pool, calib_pool, eval_set = task.load_data(cfg)
+    eval_shots = build_shots_per_example(task, demo_pool, eval_set, k, fs_seed, use_canon)
+    calib_shots = build_shots_per_example(task, demo_pool, calib_pool, k, fs_seed, use_canon)
 
-        # Split calibration examples into two folds.
-        rng = random.Random(seed + 1009 * l)
-        idx = list(range(m))
-        rng.shuffle(idx)
-        half = m // 2
-        idx_a = torch.tensor(idx[:half], dtype=torch.long)
-        idx_b = torch.tensor(idx[half:], dtype=torch.long)
+    ns_acc, _, _ = evaluate(
+        model, tok, task, eval_set, [[] for _ in eval_set], cfg.max_seq_len, bs=cfg.bs_eval
+    )
+    fs_acc, _, _ = evaluate(
+        model, tok, task, eval_set, eval_shots, cfg.max_seq_len, bs=cfg.bs_eval
+    )
 
-        if len(idx_a) < 2 or len(idx_b) < 2:
-            continue
+    _, cp_ns, _ = evaluate(
+        model, tok, task, calib_pool, [[] for _ in calib_pool], cfg.max_seq_len, bs=cfg.bs_eval
+    )
+    _, cp_fs, _ = evaluate(
+        model, tok, task, calib_pool, calib_shots, cfg.max_seq_len, bs=cfg.bs_eval
+    )
+    g_idx = build_correction_set(calib_pool, cp_ns, cp_fs, task)
+    if len(g_idx) < 4:
+        raise RuntimeError(f"G_full too small for cross-fit: {len(g_idx)}")
 
-        layer_score = torch.zeros(d, dtype=torch.float32)
-        folds = [(idx_a, idx_b), (idx_b, idx_a)]
+    G = [calib_pool[i] for i in g_idx]
+    G_demos = [calib_shots[i] for i in g_idx]
 
-        for fit_idx, val_idx in folds:
-            H_fit = H[fit_idx].to(device)
-            Y_fit = Y[fit_idx].to(device)
-            H_val = H[val_idx].to(device)
-            Y_val = Y[val_idx].to(device)
+    H_NS, Z_FS = collect_calibration_tensors(
+        model, tok, task, G, G_demos, cfg.num_layers, cfg.hidden_size, cfg.max_seq_len, verbose=False
+    )
 
-            # SS_tot per column = |B| * Var(delta) (up to the 1/|B| factor;
-            # we keep it in this form so score = max(0,R2) * Var(delta) drops
-            # straight out of max(0, SS_tot - SS_res) / |B|).
-            y_mean = Y_val.mean(dim=0, keepdim=True)
-            sst = ((Y_val - y_mean) ** 2).sum(dim=0) + 1e-8
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    selected, p_star, _ = auto_select_rows_xdelta(
+        H_NS=H_NS,
+        Z_FS=Z_FS,
+        W0=weights_snapshot,
+        num_layers=cfg.num_layers,
+        hidden_size=cfg.hidden_size,
+        mu=cfg.mu,
+        cumulative_target=cumulative_target,
+        seed=fs_seed,
+        device=device,
+        verbose=False,
+    )
 
-            fold_score = torch.zeros(d, dtype=torch.float32, device="cpu")
+    restore_o_proj(model, weights_snapshot)
+    n_edited, _ = apply_edit(model, selected, H_NS, Z_FS, cfg.mu, cfg.alpha)
+    auto_acc, _, _ = evaluate(
+        model, tok, task, eval_set, [[] for _ in eval_set], cfg.max_seq_len, bs=cfg.bs_eval
+    )
+    restore_o_proj(model, weights_snapshot)
 
-            for start in range(0, d, chunk_rows):
-                end = min(start + chunk_rows, d)
+    recovery = _recovery_pct(ns_acc, fs_acc, auto_acc)
+    print(
+        f"{cfg.task_key:<14} NS={ns_acc*100:6.2f} "
+        f"FS={fs_acc*100:6.2f} Auto={auto_acc*100:6.2f} "
+        f"p*={p_star:.3f} rec={recovery:6.1f}%"
+    )
 
-                DeltaW_chunk = _ridge_solve_chunk(
-                    H_fit=H_fit, Y_fit_chunk=Y_fit[:, start:end], mu=mu,
-                )
-                pred = H_val @ DeltaW_chunk.T
+    return {
+        "model": cfg.model_key,
+        "task": cfg.task_key,
+        "ns_acc": ns_acc,
+        "fs_acc": fs_acc,
+        "auto_edit_acc": auto_acc,
+        "recovery_pct": recovery,
+        "p_star": p_star,
+        "n_selected": n_edited,
+        "g_size": len(G),
+        "fs_seed": fs_seed,
+    }
 
-                residual = Y_val[:, start:end] - pred
-                sse = (residual ** 2).sum(dim=0)
-                sst_chunk = sst[start:end]
 
-                r2 = 1.0 - sse / sst_chunk
-                r2_pos = torch.clamp(r2, min=0.0)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True, choices=list(MODELS.keys()))
+    ap.add_argument("--tasks", nargs="+", required=True, choices=list(TASKS.keys()))
+    ap.add_argument("--out-dir", default="runs/auto_p")
+    ap.add_argument("--n-eval", type=int, default=0, help="0 -> task defaults")
+    ap.add_argument("--n-calib-pool", type=int, default=0, help="0 -> task defaults")
+    ap.add_argument("--fs-seed", type=int, default=1)
+    ap.add_argument("--cumulative-target", type=float, default=0.90)
+    args = ap.parse_args()
 
-                # max(0, R2) * Var(delta), modulo the 1/|B| factor on Var.
-                # Constant factor doesn't affect ranking, but keep it
-                # equivalent for transparency.
-                var_delta = sst_chunk / max(1, len(val_idx))
-                score = r2_pos * var_delta
+    os.makedirs(args.out_dir, exist_ok=True)
 
-                fold_score[start:end] = score.detach().float().cpu()
+    first_task = args.tasks[0]
+    first_defaults = TASK_DEFAULTS.get(first_task, {})
+    cfg0 = ExperimentConfig(
+        model_key=args.model,
+        task_key=first_task,
+        n_eval=args.n_eval if args.n_eval > 0 else first_defaults.get("n_eval", 150),
+        n_train_pool=first_defaults.get("n_train_pool", 128),
+        n_calib_pool=(
+            args.n_calib_pool if args.n_calib_pool > 0 else first_defaults.get("n_calib_pool", 500)
+        ),
+        bs_eval=first_defaults.get("bs_eval", 1),
+        max_seq_len=first_defaults.get("max_seq_len"),
+        out_dir=args.out_dir,
+    )
+    cfg0.finalize()
 
-            layer_score += fold_score / len(folds)
+    model, tok = load_model_and_tokenizer(cfg0)
+    ORIG = snapshot_o_proj(model)
 
-        total_score = float(layer_score.sum().item())
-        per_layer_total_score[l] = total_score
+    rows = []
+    for task_key in args.tasks:
+        defaults = TASK_DEFAULTS.get(task_key, {})
+        cfg = ExperimentConfig(
+            model_key=args.model,
+            task_key=task_key,
+            n_eval=args.n_eval if args.n_eval > 0 else defaults.get("n_eval", 150),
+            n_train_pool=defaults.get("n_train_pool", 128),
+            n_calib_pool=(
+                args.n_calib_pool if args.n_calib_pool > 0 else defaults.get("n_calib_pool", 500)
+            ),
+            bs_eval=defaults.get("bs_eval", 1),
+            max_seq_len=defaults.get("max_seq_len"),
+            num_layers=cfg0.num_layers,
+            hidden_size=cfg0.hidden_size,
+            out_dir=args.out_dir,
+        )
+        cfg.finalize()
 
-        for j in range(d):
-            s = float(layer_score[j].item())
-            if s > 0:
-                all_rows.append((s, l, j))
+        try:
+            row = run_one_task(
+                model=model,
+                tok=tok,
+                cfg=cfg,
+                weights_snapshot=ORIG,
+                fs_seed=args.fs_seed,
+                cumulative_target=args.cumulative_target,
+            )
+            rows.append(row)
+        except Exception as e:
+            print(f"[ERROR] {task_key}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            restore_o_proj(model, ORIG)
 
-        if verbose:
-            print(f"[auto-p] layer={l:02d} "
-                  f"total_score={total_score:.4e} "
-                  f"max_row={float(layer_score.max().item()):.4e}")
+    out_path = os.path.join(args.out_dir, f"{args.model}_auto_p.json")
+    with open(out_path, "w") as f:
+        json.dump(rows, f, indent=2)
 
-    if not all_rows:
-        raise RuntimeError("auto-p: no positive-scoring rows found")
+    print("\nSaved:", out_path)
 
-    # ----- 3. shortest 90% prefix -----
-    all_rows.sort(reverse=True, key=lambda x: x[0])
 
-    scores = torch.tensor([x[0] for x in all_rows], dtype=torch.float32)
-    cum = torch.cumsum(scores, dim=0) / (scores.sum() + 1e-12)
-    k_energy = int(torch.searchsorted(cum, torch.tensor(cumulative_target)).item()) + 1
-
-    # ----- 4. sparsity clamp -----
-    total_rows = L * d
-    min_k = int(round(P_MIN * total_rows))
-    max_k = int(round(P_MAX * total_rows))
-    k = max(k_energy, min_k)
-    k = min(k, max_k, len(all_rows))
-
-    # ----- 5. per-layer cap -----
-    layer_cap = int(round(LAYER_CAP_FRAC * d))
-    selected: List[Tuple[int, int]] = []
-    layer_counts: Dict[int, int] = {}
-    R2_map: Dict[Tuple[int, int], float] = {}
-
-    for score, l, j in all_rows:
-        if len(selected) >= k:
-            break
-        if layer_counts.get(l, 0) >= layer_cap:
-            continue
-        selected.append((l, j))
-        layer_counts[l] = layer_counts.get(l, 0) + 1
-        R2_map[(l, j)] = score
-
-    p_star = len(selected) / float(total_rows)
-
-    if verbose:
-        print(f"[auto-p] k_energy={k_energy}  k_after_clamp={k}  "
-              f"layer_cap={layer_cap}  p*={p_star:.4f}")
-        print(f"[auto-p] selected per-layer: "
-              f"{sorted(layer_counts.items(), key=lambda x: x[1], reverse=True)}")
-
-    return selected, p_star, R2_map
+if __name__ == "__main__":
+    main()
